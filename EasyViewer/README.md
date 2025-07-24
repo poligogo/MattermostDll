@@ -1,6 +1,7 @@
 # Mattermost 聊天記錄查看器 (EasyViewer)
 
 這是一個簡易的 Web 介面，用於查看使用 MattermostDl 下載的聊天記錄。
+![MattermostWebview](img/index.png)
 
 ## 功能特色
 
