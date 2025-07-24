@@ -154,4 +154,4 @@ def serve_file(date, channel_name, filename):
         return jsonify({'error': f'File not found: {str(e)}'}), 404
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5002)
+    app.run(debug=True, host='0.0.0.0', port=5003)
