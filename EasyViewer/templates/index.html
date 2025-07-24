@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+
+{% block sidebar %}
+<div class="p-3">
+    <h5 class="mb-3">
+        <i class="fas fa-comments"></i>
+        聊天記錄查看器
+    </h5>
+    
+    <!-- 日期選擇 -->
+    <div class="mb-3">
+        <label for="dateSelect" class="form-label">選擇日期:</label>
+        <select class="form-select" id="dateSelect">
+            <option value="">請選擇日期</option>
+            {% for date in dates %}
+            <option value="{{ date }}">{{ date[:4] }}-{{ date[4:6] }}-{{ date[6:8] }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <!-- 頻道列表 -->
+    <div class="mb-3">
+        <label class="form-label">頻道列表:</label>
+        <div id="channelList" class="border rounded" style="max-height: 60vh; overflow-y: auto;">
+            <div class="text-muted text-center p-3">請先選擇日期</div>
+        </div>
+    </div>
+    
+    <!-- 搜尋功能 -->
+    <div class="mb-3">
+        <label for="searchInput" class="form-label">搜尋訊息:</label>
+        <input type="text" class="form-control" id="searchInput" placeholder="搜尋訊息或使用者名稱...">
+        <div class="mt-2">
+            <small class="text-muted">搜尋結果: <span id="searchResults">0</span> 條訊息</small>
+            <button class="btn btn-sm btn-outline-secondary ms-2" id="clearSearch" style="display: none;">清除搜尋</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="p-3">
+    <!-- 頻道資訊 -->
+    <div id="channelInfo" class="channel-info" style="display: none;">
+        <h4 id="channelName"></h4>
+        <p class="mb-0">
+            <small class="text-muted">
+                <i class="fas fa-calendar"></i> 匯出時間: <span id="exportTime"></span> |
+                <i class="fas fa-comment"></i> 總訊息數: <span id="totalPosts"></span>
+            </small>
+        </p>
+    </div>
+    
+    <!-- 載入中 -->
+    <div id="loading" class="loading" style="display: none;">
+        <i class="fas fa-spinner fa-spin fa-2x"></i>
+        <p class="mt-2">載入中...</p>
+    </div>
+    
+    <!-- 聊天容器 -->
+    <div id="chatContainer" class="chat-container p-3" style="display: none;">
+        <!-- 聊天訊息將在這裡顯示 -->
+    </div>
+    
+    <!-- 歡迎訊息 -->
+    <div id="welcomeMessage" class="text-center mt-5">
+        <i class="fas fa-comments fa-4x text-muted mb-3"></i>
+        <h3 class="text-muted">歡迎使用 Mattermost 聊天記錄查看器</h3>
+        <p class="text-muted">請選擇日期和頻道來查看聊天記錄</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentChannelData = null;
+let filteredPosts = null;
+
+// 日期選擇變更
+$('#dateSelect').change(function() {
+    const selectedDate = $(this).val();
+    if (selectedDate) {
+        loadChannels(selectedDate);
+    } else {
+        $('#channelList').html('<div class="text-muted text-center p-3">請先選擇日期</div>');
+        hideChat();
+    }
+});
+
+// 載入頻道列表
+function loadChannels(date) {
+    $('#channelList').html('<div class="text-center p-3"><i class="fas fa-spinner fa-spin"></i> 載入中...</div>');
+    
+    $.get(`/api/channels/${date}`)
+        .done(function(channels) {
+            if (channels.length === 0) {
+                $('#channelList').html('<div class="text-muted text-center p-3">沒有找到頻道</div>');
+                return;
+            }
+            
+            let html = '';
+            channels.forEach(function(channel) {
+                html += `
+                    <div class="channel-item" data-date="${date}" data-channel="${channel.name}" data-json="${channel.json_file}">
+                        <div class="fw-bold">${channel.name}</div>
+                        <small class="text-muted">${channel.json_file}</small>
+                    </div>
+                `;
+            });
+            
+            $('#channelList').html(html);
+            
+            // 綁定頻道點擊事件
+            $('.channel-item').click(function() {
+                $('.channel-item').removeClass('active');
+                $(this).addClass('active');
+                
+                const date = $(this).data('date');
+                const channel = $(this).data('channel');
+                const jsonFile = $(this).data('json');
+                
+                loadChannelData(date, channel, jsonFile);
+            });
+        })
+        .fail(function() {
+            $('#channelList').html('<div class="text-danger text-center p-3">載入失敗</div>');
+        });
+}
+
+// 載入頻道聊天資料
+function loadChannelData(date, channelName, jsonFile) {
+    showLoading();
+    
+    $.get(`/api/channel/${date}/${encodeURIComponent(channelName)}/${encodeURIComponent(jsonFile)}`)
+        .done(function(data) {
+            currentChannelData = data;
+            filteredPosts = data.posts;
+            displayChannelData(data);
+            hideLoading();
+        })
+        .fail(function() {
+            hideLoading();
+            alert('載入頻道資料失敗');
+        });
+}
+
+// 顯示頻道資料
+function displayChannelData(data) {
+    // 建立搜尋索引
+    searchIndex = buildSearchIndex(data.posts);
+    
+    // 顯示頻道資訊
+    $('#channelName').text(data.channel.display_name || data.channel.name);
+    $('#exportTime').text(data.channel.exported_at || '未知');
+    $('#totalPosts').text(data.total_posts);
+    $('#searchResults').text(data.total_posts);
+    $('#channelInfo').show();
+    
+    // 顯示聊天訊息
+    displayMessages(filteredPosts);
+    
+    $('#welcomeMessage').hide();
+    $('#chatContainer').show();
+    
+    // 滾動到底部
+    $('#chatContainer').scrollTop($('#chatContainer')[0].scrollHeight);
+}
+
+// 顯示訊息
+function displayMessages(posts) {
+    let html = '';
+    
+    posts.forEach(function(post) {
+        const isReply = post.root_id ? 'reply-indicator' : '';
+        
+        html += `
+            <div class="message ${isReply}">
+                <div class="message-header">
+                    <span class="username">${post.username}</span>
+                    <span class="timestamp">${post.formatted_time}</span>
+                </div>
+                <div class="message-content">
+                    ${post.message_html || ''}
+                </div>
+        `;
+        
+        // 顯示附件
+        if (post.existing_files && post.existing_files.length > 0) {
+            html += '<div class="mt-2">';
+            post.existing_files.forEach(function(file) {
+                const fileClass = file.exists ? 'file-attachment' : 'file-attachment file-missing';
+                const icon = file.exists ? 'fas fa-download' : 'fas fa-exclamation-triangle';
+                const title = file.exists ? '點擊下載' : '檔案不存在';
+                
+                if (file.exists) {
+                    const date = $('#dateSelect').val();
+                    const channelName = $('.channel-item.active').data('channel');
+                    const fileUrl = `/files/${date}/${encodeURIComponent(channelName)}/${encodeURIComponent(file.actual_name)}`;
+                    
+                    // 檢查是否為圖片檔案
+                    const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
+                    const isImage = imageExtensions.some(ext => 
+                        file.original_name.toLowerCase().endsWith(ext) || 
+                        file.actual_name.toLowerCase().endsWith(ext)
+                    );
+                    
+                    if (isImage) {
+                        html += `
+                            <div class="image-attachment mb-2">
+                                <img src="${fileUrl}" alt="${file.original_name}" 
+                                     class="img-fluid rounded" style="max-width: 400px; max-height: 300px; cursor: pointer;"
+                                     onclick="window.open('${fileUrl}', '_blank')" 
+                                     title="點擊查看原圖">
+                                <div class="small text-muted mt-1">
+                                    <i class="fas fa-image"></i> ${file.original_name}
+                                    <a href="${fileUrl}" class="ms-2" target="_blank" title="下載">
+                                        <i class="fas fa-download"></i>
+                                    </a>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        html += `
+                            <a href="${fileUrl}" 
+                               class="${fileClass}" title="${title}" target="_blank">
+                                <i class="${icon}"></i> ${file.original_name}
+                            </a>
+                        `;
+                    }
+                } else {
+                    html += `
+                        <span class="${fileClass}" title="${title}">
+                            <i class="${icon}"></i> ${file.original_name}
+                        </span>
+                    `;
+                }
+            });
+            html += '</div>';
+        }
+        
+        html += '</div>';
+    });
+    
+    $('#chatContainer').html(html);
+}
+
+// 搜尋功能優化
+let searchTimeout;
+let searchIndex = null;
+
+// 建立搜尋索引
+function buildSearchIndex(posts) {
+    return posts.map((post, index) => ({
+        index: index,
+        searchText: `${post.message} ${post.username}`.toLowerCase(),
+        post: post
+    }));
+}
+
+// 模糊搜尋函數
+function fuzzySearch(searchTerm, text) {
+    if (!searchTerm) return true;
+    
+    // 直接包含搜尋
+    if (text.includes(searchTerm)) return true;
+    
+    // 模糊搜尋 - 檢查字符順序
+    let searchIndex = 0;
+    for (let i = 0; i < text.length && searchIndex < searchTerm.length; i++) {
+        if (text[i] === searchTerm[searchIndex]) {
+            searchIndex++;
+        }
+    }
+    return searchIndex === searchTerm.length;
+}
+
+// 執行搜尋
+function performSearch(searchTerm) {
+    if (!currentChannelData || !searchIndex) {
+        return;
+    }
+    
+    if (searchTerm === '') {
+        filteredPosts = currentChannelData.posts;
+        $('#clearSearch').hide();
+    } else {
+        const lowerSearchTerm = searchTerm.toLowerCase();
+        filteredPosts = searchIndex
+            .filter(item => fuzzySearch(lowerSearchTerm, item.searchText))
+            .map(item => item.post);
+        $('#clearSearch').show();
+    }
+    
+    $('#searchResults').text(filteredPosts.length);
+    displayMessages(filteredPosts);
+}
+
+// 搜尋輸入事件（防抖動）
+$('#searchInput').on('input', function() {
+    const searchTerm = $(this).val();
+    
+    // 清除之前的計時器
+    clearTimeout(searchTimeout);
+    
+    // 設定新的計時器（300ms 延遲）
+    searchTimeout = setTimeout(() => {
+        performSearch(searchTerm);
+    }, 300);
+});
+
+// 清除搜尋
+$('#clearSearch').click(function() {
+    $('#searchInput').val('');
+    performSearch('');
+});
+
+// 顯示載入中
+function showLoading() {
+    $('#loading').show();
+    $('#chatContainer').hide();
+    $('#channelInfo').hide();
+    $('#welcomeMessage').hide();
+}
+
+// 隱藏載入中
+function hideLoading() {
+    $('#loading').hide();
+}
+
+// 隱藏聊天
+function hideChat() {
+    $('#chatContainer').hide();
+    $('#channelInfo').hide();
+    $('#welcomeMessage').show();
+    currentChannelData = null;
+    filteredPosts = null;
+    searchIndex = null;
+    $('#searchInput').val('');
+    $('#searchResults').text('0');
+    $('#clearSearch').hide();
+    clearTimeout(searchTimeout);
+}
+</script>
+{% endblock %}
