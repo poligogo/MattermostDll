@@ -326,9 +326,9 @@ def process_single_post(post, i_post, user_id_to_name, d, output_base, download_
     user_id = post["user_id"]
     if user_id not in user_id_to_name:
         try:
-            user_id_to_name[user_id] = d.users.get_user(user_id)["username"]
-        except exceptions.ResourceNotFound:
-            user_id_to_name[user_id] = user_id
+                    user_id_to_name[user_id] = d.users.get_user(user_id)["username"]
+                except exceptions.ResourceNotFound:
+                    user_id_to_name[user_id] = user_id
     username = user_id_to_name[user_id]
     created_str = datetime.fromtimestamp(post["create_at"] / 1000, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     message = post["message"]
