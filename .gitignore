@@ -11,3 +11,4 @@ wheels/
 results/
 results/*
 config.json
+.vercel
