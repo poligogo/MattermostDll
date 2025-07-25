@@ -11,8 +11,107 @@ import pathlib
 import getpass
 import logging
 from datetime import datetime, date, timezone
-from typing import Dict
+from typing import Dict, Optional, Tuple
 from mattermostdriver import Driver, exceptions
+
+
+def should_download_file(filename: str, config: Dict) -> Tuple[bool, str]:
+    """檢查檔案是否應該下載（基於副檔名過濾）"""
+    excluded_extensions = config.get('excluded_extensions', [])
+    if not excluded_extensions:
+        return True, "no_filter"
+    
+    # 獲取檔案副檔名
+    file_ext = os.path.splitext(filename)[1].lower()
+    
+    if file_ext in excluded_extensions:
+        return False, f"excluded_extension_{file_ext}"
+    
+    return True, "allowed"
+
+
+class IncrementalDownloadManager:
+    """增量下載管理器"""
+    
+    def __init__(self, output_base: str):
+        self.output_base = output_base
+        self.sync_state_file = os.path.join(output_base, 'sync_state.json')
+        self.sync_state = self._load_sync_state()
+    
+    def _load_sync_state(self) -> Dict:
+        """載入同步狀態"""
+        if os.path.exists(self.sync_state_file):
+            try:
+                with open(self.sync_state_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return self._create_empty_sync_state()
+        return self._create_empty_sync_state()
+    
+    def _create_empty_sync_state(self) -> Dict:
+        """創建空的同步狀態"""
+        return {
+            "version": "1.0",
+            "created_at": datetime.now().isoformat(),
+            "last_full_sync": None,
+            "channels_last_sync": {},
+            "downloaded_files": {},  # file_id -> {"path": "", "hash": "", "timestamp": ""}
+            "sync_history": []
+        }
+    
+    def get_channel_last_sync_time(self, channel_id: str) -> Optional[float]:
+        """獲取頻道的最後同步時間（Unix 時間戳）"""
+        channel_info = self.sync_state['channels_last_sync'].get(channel_id)
+        if channel_info and 'last_post_timestamp' in channel_info:
+            # 將 ISO 格式轉換為 Unix 時間戳
+            try:
+                dt = datetime.fromisoformat(channel_info['last_post_timestamp'].replace('Z', '+00:00'))
+                return dt.timestamp()
+            except ValueError:
+                return None
+        return None
+    
+    def update_channel_sync_time(self, channel_id: str, channel_name: str, 
+                                last_post_timestamp: str, last_post_id: str):
+        """更新頻道的同步時間"""
+        if channel_id not in self.sync_state['channels_last_sync']:
+            self.sync_state['channels_last_sync'][channel_id] = {}
+        
+        self.sync_state['channels_last_sync'][channel_id].update({
+            "channel_name": channel_name,
+            "last_post_timestamp": last_post_timestamp,
+            "last_sync_time": datetime.now().isoformat(),
+            "last_post_id": last_post_id
+        })
+        self._save_sync_state()
+    
+    def is_file_downloaded(self, file_id: str) -> bool:
+        """檢查檔案是否已下載"""
+        return file_id in self.sync_state['downloaded_files']
+    
+    def mark_file_downloaded(self, file_id: str, file_path: str, file_hash: str = None):
+        """標記檔案為已下載"""
+        self.sync_state['downloaded_files'][file_id] = {
+            "path": file_path,
+            "hash": file_hash,
+            "timestamp": datetime.now().isoformat()
+        }
+        self._save_sync_state()
+    
+    def _save_sync_state(self):
+        """儲存同步狀態"""
+        os.makedirs(os.path.dirname(self.sync_state_file), exist_ok=True)
+        with open(self.sync_state_file, 'w', encoding='utf-8') as f:
+            json.dump(self.sync_state, f, indent=2, ensure_ascii=False)
+    
+    def has_sync_history(self) -> bool:
+        """檢查是否有同步歷史"""
+        return bool(self.sync_state['channels_last_sync'])
+    
+    def clear_sync_state(self):
+        """清空同步狀態（用於完整重新同步）"""
+        self.sync_state = self._create_empty_sync_state()
+        self._save_sync_state()
 
 
 def find_mmauthtoken_firefox(host):
@@ -126,6 +225,41 @@ def complete_config(config: dict, config_filename: str = "config.json") -> dict:
         config["download_files"] = dec == "y"
         config_changed = True
 
+    # 檔案副檔名過濾配置
+    if "excluded_extensions" in config:
+        print(f"Excluded file extensions from config: {', '.join(config['excluded_extensions'])}")
+    else:
+        print("\n=== 檔案副檔名過濾設定 ===")
+        print("您可以設定要排除下載的檔案副檔名（例如：.exe, .msi, .zip）")
+        extensions_input = input("請輸入要排除的副檔名，用逗號分隔（留空表示下載所有檔案）: ")
+        if extensions_input.strip():
+            # 處理使用者輸入的副檔名
+            extensions = [ext.strip().lower() for ext in extensions_input.split(',')]
+            # 確保副檔名以點開頭
+            extensions = [ext if ext.startswith('.') else '.' + ext for ext in extensions if ext]
+            config["excluded_extensions"] = extensions
+            print(f"設定排除的副檔名: {', '.join(extensions)}")
+        else:
+            config["excluded_extensions"] = []
+            print("未設定副檔名過濾，將下載所有檔案")
+        config_changed = True
+
+    # 增量下載配置
+    if "enable_incremental_download" in config:
+        print(f"Incremental download enabled: {config['enable_incremental_download']}")
+    else:
+        print("\n=== 增量下載設定 ===")
+        print("增量下載功能可以只下載新的對話和檔案，避免重複下載")
+        dec = ""
+        while not (dec == "y" or dec == "n"):
+            dec = input("是否啟用增量下載功能? y/n: ")
+        config["enable_incremental_download"] = dec == "y"
+        if config["enable_incremental_download"]:
+            print("已啟用增量下載功能")
+        else:
+            print("已停用增量下載功能，將進行完整下載")
+        config_changed = True
+
     if config_changed:
         dec = ""
         while not (dec == "y" or dec == "n"):
@@ -180,7 +314,8 @@ def select_team(d: Driver, my_user_id: str):
     return team
 
 
-def process_single_post(post, i_post, user_id_to_name, d, output_base, download_files, before, after):
+def process_single_post(post, i_post, user_id_to_name, d, output_base, download_files, before, after, 
+                       config=None, file_stats=None, incremental_manager=None):
     """處理單個 post，返回處理後的 post 資料或 None（如果被日期過濾）"""
     
     # Filter posts by date range
@@ -228,31 +363,53 @@ def process_single_post(post, i_post, user_id_to_name, d, output_base, download_
     if "files" in post["metadata"]:
         filenames = []
         for file in post["metadata"]["files"]:
+            filename = file["name"]
+            file_id = file["id"]
+            filenames.append(filename)
+            
             if download_files:
+                # 檢查檔案是否已下載（增量下載功能）
+                if incremental_manager and incremental_manager.is_file_downloaded(file_id):
+                    print(f"檔案已存在，跳過: {filename}")
+                    if file_stats:
+                        file_stats['skipped'] += 1
+                        file_stats['skip_reasons']['already_downloaded'] = file_stats['skip_reasons'].get('already_downloaded', 0) + 1
+                    continue
+                
+                # 檢查副檔名過濾
+                should_download, skip_reason = should_download_file(filename, config or {})
+                if not should_download:
+                    print(f"跳過檔案 {filename}: 副檔名被排除 ({skip_reason})")
+                    if file_stats:
+                        file_stats['skipped'] += 1
+                        file_stats['skip_reasons'][skip_reason] = file_stats['skip_reasons'].get(skip_reason, 0) + 1
+                    continue
+                
                 # 生成基礎檔案名稱
                 base_filename = "%03d" % i_post + "_" + file["name"]
-                filename = base_filename
+                filename_to_save = base_filename
                 
                 # 檢查檔案是否已存在，如果存在則添加數字後綴
                 counter = 1
-                while (output_base / filename).exists():
+                while (output_base / filename_to_save).exists():
                     name_parts = file["name"].rsplit('.', 1)
                     if len(name_parts) == 2:
                         # 有副檔名的情況
-                        filename = "%03d" % i_post + "_" + name_parts[0] + f"_({counter})." + name_parts[1]
+                        filename_to_save = "%03d" % i_post + "_" + name_parts[0] + f"_({counter})." + name_parts[1]
                     else:
                         # 沒有副檔名的情況
-                        filename = "%03d" % i_post + "_" + file["name"] + f"_({counter})"
+                        filename_to_save = "%03d" % i_post + "_" + file["name"] + f"_({counter})"
                     counter += 1
                 
                 print("Downloading", file["name"])
-                if filename != base_filename:
-                    print(f"  -> 檔案已存在，儲存為: {filename}")
+                if filename_to_save != base_filename:
+                    print(f"  -> 檔案已存在，儲存為: {filename_to_save}")
                 
                 # 限制重試次數，避免無限迴圈
                 max_retries = 3
                 retry_count = 0
                 resp = None
+                download_success = False
                 
                 while retry_count < max_retries:
                     try:
@@ -270,28 +427,45 @@ def process_single_post(post, i_post, user_id_to_name, d, output_base, download_
                     try:
                         # Mattermost Driver unfortunately parses json files to dicts
                         if isinstance(resp, dict):
-                            with open(output_base / filename, "w") as f:
+                            with open(output_base / filename_to_save, "w") as f:
                                 json.dump(resp, f)
                         elif isinstance(resp, list):
-                            with open(output_base / filename, "w") as f:
+                            with open(output_base / filename_to_save, "w") as f:
                                 json.dump(resp, f)
                         else:
-                            with open(output_base / filename, "wb") as f:
+                            with open(output_base / filename_to_save, "wb") as f:
                                 f.write(resp.content)
                         print(f"Successfully downloaded {file['name']}")
+                        download_success = True
+                        
+                        # 標記檔案為已下載（增量下載功能）
+                        if incremental_manager:
+                            file_path = str(output_base / filename_to_save)
+                            incremental_manager.mark_file_downloaded(file_id, file_path)
+                        
                     except Exception as e:
                         print(f"Failed to save file {file['name']}: {str(e)}")
+                        download_success = False
                 else:
                     print(f"Skipped downloading {file['name']} due to repeated failures")
+                    download_success = False
+                
+                # 更新檔案統計
+                if file_stats:
+                    if download_success:
+                        file_stats['downloaded'] += 1
+                    else:
+                        file_stats['skipped'] += 1
+                        file_stats['skip_reasons']['download_failed'] = file_stats['skip_reasons'].get('download_failed', 0) + 1
 
-            filenames.append(file["name"])
         simple_post["files"] = filenames
     
     return simple_post
 
 
 def export_channel(d: Driver, channel: str, user_id_to_name: Dict[str, str], output_base: str,
-                   download_files: bool = True, before: str = None, after: str = None):
+                   download_files: bool = True, before: str = None, after: str = None, 
+                   config: Dict = None, file_stats: Dict = None, incremental_manager=None):
     """匯出頻道資料，包含檔案覆蓋防護和流式寫入"""
     # Sanitize channel name
     channel_name = channel["display_name"].replace("\\", "").replace("/", "")
@@ -356,7 +530,8 @@ def export_channel(d: Driver, channel: str, user_id_to_name: Dict[str, str], out
             for post in page_posts:
                 # 即時處理每個 post，減少記憶體佔用
                 simple_post = process_single_post(post, total_posts_processed, user_id_to_name, d, 
-                                                 output_base, download_files, before, after)
+                                                 output_base, download_files, before, after,
+                                                 config, file_stats, incremental_manager)
                 
                 if simple_post is not None:  # 如果 post 通過日期過濾
                     if not first_post:
@@ -473,6 +648,19 @@ def auto_download_all_channels():
     # 設置日誌記錄
     logger, file_logger, log_file = setup_logging(output_base)
     
+    # 初始化增量下載管理器
+    incremental_manager = None
+    if config.get('enable_incremental_download', False):
+        incremental_manager = IncrementalDownloadManager(output_base)
+        log_and_print(logger, "已啟用增量下載功能")
+    
+    # 初始化全域檔案統計
+    global_file_stats = {
+        'downloaded': 0,
+        'skipped': 0,
+        'skip_reasons': {}
+    }
+    
     log_and_print(logger, "=== 自動批量下載所有頻道 ===")
     log_and_print(logger, f"儲存下載資料到 {output_base}")
     log_and_print(logger, f"日誌檔案位置: {log_file}")
@@ -525,6 +713,31 @@ def auto_download_all_channels():
     channels = sorted(channels, key=lambda x: x["display_name"].lower())
     
     log_and_print(logger, f"找到 {len(channels)} 個頻道！")
+    
+    # 檢查增量下載歷史
+    sync_mode = "full"
+    if incremental_manager and incremental_manager.has_sync_history():
+        log_and_print(logger, "\n=== 發現同步歷史 ===")
+        log_and_print(logger, f"已同步的頻道數: {len(incremental_manager.sync_state['channels_last_sync'])}")
+        
+        choice = ""
+        while choice not in ["i", "f", "s"]:
+            choice = input("請選擇同步模式 (i=增量同步, f=完整重新同步, s=選擇性同步): ").lower()
+        
+        if choice == "i":
+            log_and_print(logger, "使用增量同步模式...")
+            sync_mode = "incremental"
+        elif choice == "f":
+            log_and_print(logger, "使用完整重新同步模式...")
+            sync_mode = "full"
+            # 清空同步狀態
+            incremental_manager.clear_sync_state()
+        else:
+            log_and_print(logger, "使用選擇性同步模式...")
+            sync_mode = "selective"
+    elif incremental_manager:
+        log_and_print(logger, "首次同步，將進行完整下載...")
+        sync_mode = "full"
     
     # 頻道列表顯示（控制台不顯示時間戳，但記錄到日誌）
     print("\n頻道列表：")
@@ -741,16 +954,43 @@ def auto_download_all_channels():
         return
     
     # 開始批量下載
-    log_and_print(logger, f"\n=== 開始批量下載 {len(filtered_channels)} 個頻道 ===")
+    log_and_print(logger, f"\n=== 開始{sync_mode}下載 {len(filtered_channels)} 個頻道 ===")
+    
+    # 顯示檔案過濾設定
+    if config.get('excluded_extensions'):
+        log_and_print(logger, f"檔案過濾設定: 排除 {', '.join(config['excluded_extensions'])} 檔案")
+    else:
+        log_and_print(logger, "檔案過濾設定: 下載所有檔案")
+    
     failed_channels = []
+    total_new_posts = 0
+    total_new_files = 0
+    
     for i_channel, channel in enumerate(filtered_channels):
         try:
             progress_msg = f"\n[{i_channel + 1}/{len(filtered_channels)}] 開始匯出頻道: {channel['display_name']}"
             log_and_print(logger, progress_msg)
+            
+            # 重置頻道級別的檔案統計
+            channel_file_stats = {
+                'downloaded': 0,
+                'skipped': 0,
+                'skip_reasons': {}
+            }
+            
             export_channel(d, channel, user_id_to_name, output_base, 
-                         config["download_files"], before, after)
-            success_msg = f"✓ 完成匯出: {channel['display_name']}"
+                         config["download_files"], before, after, 
+                         config, channel_file_stats, incremental_manager)
+            
+            # 更新全域統計
+            global_file_stats['downloaded'] += channel_file_stats['downloaded']
+            global_file_stats['skipped'] += channel_file_stats['skipped']
+            for reason, count in channel_file_stats['skip_reasons'].items():
+                global_file_stats['skip_reasons'][reason] = global_file_stats['skip_reasons'].get(reason, 0) + count
+            
+            success_msg = f"✓ 完成匯出: {channel['display_name']} (下載 {channel_file_stats['downloaded']} 檔案, 跳過 {channel_file_stats['skipped']} 檔案)"
             log_and_print(logger, success_msg)
+            
         except Exception as e:
             error_msg = f"✗ 匯出失敗: {channel['display_name']} - 錯誤: {str(e)}"
             log_and_print(logger, error_msg, 'error')
@@ -769,6 +1009,21 @@ def auto_download_all_channels():
     log_and_print(logger, f"嘗試下載: {len(filtered_channels)}")
     log_and_print(logger, f"成功下載: {len(filtered_channels) - len(failed_channels)}")
     log_and_print(logger, f"失敗數量: {len(failed_channels)}")
+    
+    # 檔案統計報告
+    log_and_print(logger, "\n=== 檔案下載統計 ===")
+    log_and_print(logger, f"總共下載檔案: {global_file_stats['downloaded']} 個")
+    log_and_print(logger, f"總共跳過檔案: {global_file_stats['skipped']} 個")
+    
+    if global_file_stats['skip_reasons']:
+        log_and_print(logger, "\n跳過檔案原因統計:")
+        for reason, count in global_file_stats['skip_reasons'].items():
+            log_and_print(logger, f"  - {reason}: {count} 個")
+    
+    # 保存增量下載狀態
+    if incremental_manager:
+        incremental_manager.save_sync_state()
+        log_and_print(logger, "增量下載狀態已保存")
     
     if failed_channels:
         print("\n=== 失敗的頻道清單 ===")
