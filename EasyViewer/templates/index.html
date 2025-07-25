@@ -43,18 +43,58 @@
         <label for="searchInput" class="form-label">
             <i class="fas fa-search me-2"></i>搜尋訊息
         </label>
-        <div class="position-relative">
-            <input type="text" class="form-control pe-5" id="searchInput" placeholder="搜尋訊息或使用者名稱...">
-            <i class="fas fa-search position-absolute top-50 end-0 translate-middle-y me-3 text-muted"></i>
+        <div class="row g-2 mb-2">
+            <div class="col-8">
+                <div class="position-relative">
+                    <input type="text" class="form-control pe-5" id="searchInput" placeholder="搜尋訊息或使用者名稱... (支援多關鍵字精確搜尋)">
+                    <i class="fas fa-search position-absolute top-50 end-0 translate-middle-y me-3 text-muted"></i>
+                </div>
+            </div>
+            <div class="col-4">
+                <select class="form-select" id="searchScope">
+                    <option value="channel">當前頻道</option>
+                    <option value="all">全部頻道</option>
+                </select>
+            </div>
         </div>
-        <div class="mt-3 d-flex align-items-center justify-content-between">
+        <div class="d-flex align-items-center justify-content-between">
             <small class="text-muted d-flex align-items-center">
                 <i class="fas fa-chart-bar me-1"></i>
-                搜尋結果: <span id="searchResults" class="fw-bold ms-1">0</span> 條
+                <span id="searchStatus">輸入關鍵字開始搜尋</span>
+                <span id="searchResultsInfo" style="display: none;">搜尋結果: <span id="searchResults" class="fw-bold ms-1">0</span> 條</span>
             </small>
             <button class="btn btn-sm btn-outline-secondary" id="clearSearch" style="display: none;">
                 <i class="fas fa-times me-1"></i>清除
             </button>
+        </div>
+    </div>
+    
+    <!-- 安全資訊和登出 -->
+    <div class="mt-auto pt-3 border-top" style="border-color: rgba(255, 255, 255, 0.2) !important;">
+        <div class="mb-3">
+            <small class="text-muted d-flex align-items-center mb-2">
+                <i class="fas fa-shield-alt me-2 text-success"></i>
+                <span class="fw-bold">安全連線</span>
+            </small>
+            <small class="text-muted d-block mb-1">
+                <i class="fas fa-clock me-1"></i>
+                Session 有效期: 1 小時
+            </small>
+            <small class="text-muted d-block mb-2">
+                <i class="fas fa-user me-1"></i>
+                已驗證存取
+            </small>
+        </div>
+        
+        <!-- 安全操作按鈕 -->
+        <div class="d-grid gap-2">
+            <a href="{{ url_for('change_password') }}" class="btn btn-outline-warning btn-sm">
+                <i class="fas fa-key me-2"></i>修改密碼
+            </a>
+            <a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm" 
+               onclick="return confirm('確定要登出嗎？')">
+                <i class="fas fa-sign-out-alt me-2"></i>安全登出
+            </a>
         </div>
     </div>
 </div>
@@ -148,12 +188,27 @@
 <script>
 let currentChannelData = null;
 let filteredPosts = null;
+let allChannelsData = {}; // 儲存所有頻道資料
+let globalSearchIndex = null; // 全域搜尋索引
+let isLoadingGlobalData = false; // 防止重複載入
+let maxChannelsToLoad = 20; // 最大載入頻道數量限制
+let maxMessagesPerChannel = 1000; // 每個頻道最大訊息數量限制
 
 // 日期選擇變更
 $('#dateSelect').change(function() {
     const selectedDate = $(this).val();
+    
+    // 先清理記憶體
+    clearMemory();
+    
     if (selectedDate) {
         loadChannels(selectedDate);
+        // 預載入全域搜尋資料（背景執行，延遲更長避免影響頻道載入）
+        setTimeout(() => {
+            if ($('#dateSelect').val() === selectedDate) { // 確保用戶沒有再次切換日期
+                loadAllChannelsForSearch(selectedDate);
+            }
+        }, 2000);
     } else {
         $('#channelList').html('<div class="text-muted text-center p-3">請先選擇日期</div>');
         hideChat();
@@ -239,21 +294,86 @@ function displayChannelData(data) {
     $('#chatContainer').scrollTop($('#chatContainer')[0].scrollHeight);
 }
 
+// 高亮搜尋關鍵字
+function highlightSearchTerms(text, searchTerm) {
+    if (!searchTerm || searchTerm === '') return text;
+    
+    const keywords = searchTerm.trim().split(/\s+/);
+    let highlightedText = text;
+    
+    keywords.forEach(keyword => {
+        const regex = new RegExp(`(${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+        highlightedText = highlightedText.replace(regex, '<mark style="background-color: #ffeb3b; padding: 1px 2px; border-radius: 2px;">$1</mark>');
+    });
+    
+    return highlightedText;
+}
+
+// 顯示全域搜尋結果
+function displayGlobalSearchResults(results, searchTerm) {
+    let html = '';
+    
+    if (results.length === 0) {
+        html = '<div class="text-center text-muted p-4"><i class="fas fa-search fa-2x mb-2"></i><br>未找到匹配的訊息</div>';
+    } else {
+        results.forEach(function(item) {
+            const post = item.post;
+            const isReply = post.root_id ? 'reply-indicator' : '';
+            
+            // 高亮顯示搜尋關鍵字
+            const highlightedMessage = highlightSearchTerms(post.message_html || '', searchTerm);
+            const highlightedUsername = highlightSearchTerms(post.username, searchTerm);
+            
+            html += `
+                <div class="message ${isReply}" style="border-left: 3px solid #007bff; margin-bottom: 15px;">
+                    <div class="message-header">
+                        <span class="badge bg-primary me-2">${item.channelName}</span>
+                        <span class="username">${highlightedUsername}</span>
+                        <span class="timestamp">${post.formatted_time}</span>
+                    </div>
+                    <div class="message-content">
+                        ${highlightedMessage}
+                    </div>
+            `;
+            
+            // 顯示附件（簡化版）
+            if (post.existing_files && post.existing_files.length > 0) {
+                html += '<div class="mt-2">';
+                post.existing_files.forEach(function(file) {
+                    const icon = file.exists ? 'fas fa-paperclip' : 'fas fa-exclamation-triangle';
+                    const textClass = file.exists ? 'text-muted' : 'text-warning';
+                    html += `<small class="${textClass} me-2"><i class="${icon}"></i> ${file.original_name}</small>`;
+                });
+                html += '</div>';
+            }
+            
+            html += '</div>';
+        });
+    }
+    
+    $('#chatContainer').html(html);
+}
+
 // 顯示訊息
 function displayMessages(posts) {
     let html = '';
+    const currentSearchTerm = $('#searchInput').val();
     
     posts.forEach(function(post) {
         const isReply = post.root_id ? 'reply-indicator' : '';
         
+        // 高亮顯示搜尋關鍵字
+        const highlightedMessage = highlightSearchTerms(post.message_html || '', currentSearchTerm);
+        const highlightedUsername = highlightSearchTerms(post.username, currentSearchTerm);
+        
         html += `
             <div class="message ${isReply}">
                 <div class="message-header">
-                    <span class="username">${post.username}</span>
+                    <span class="username">${highlightedUsername}</span>
                     <span class="timestamp">${post.formatted_time}</span>
                 </div>
                 <div class="message-content">
-                    ${post.message_html || ''}
+                    ${highlightedMessage}
                 </div>
         `;
         
@@ -330,42 +450,255 @@ function buildSearchIndex(posts) {
     }));
 }
 
-// 模糊搜尋函數
-function fuzzySearch(searchTerm, text) {
+// 建立全域搜尋索引
+function buildGlobalSearchIndex() {
+    let globalIndex = [];
+    
+    Object.keys(allChannelsData).forEach(channelKey => {
+        const channelData = allChannelsData[channelKey];
+        if (channelData && channelData.posts) {
+            channelData.posts.forEach((post, index) => {
+                globalIndex.push({
+                    index: index,
+                    searchText: `${post.message} ${post.username}`.toLowerCase(),
+                    post: post,
+                    channelName: channelData.channel.display_name || channelData.channel.name,
+                    channelKey: channelKey
+                });
+            });
+        }
+    });
+    
+    return globalIndex;
+}
+
+// 載入所有頻道資料（用於全域搜尋）- 優化版本
+function loadAllChannelsForSearch(date) {
+    const selectedDate = date || $('#dateSelect').val();
+    if (!selectedDate || isLoadingGlobalData) return;
+    
+    isLoadingGlobalData = true;
+    console.log('開始載入全域搜尋資料...');
+    
+    $.get(`/api/channels/${selectedDate}`)
+        .done(function(channels) {
+            // 限制載入的頻道數量
+            const channelsToLoad = channels.slice(0, maxChannelsToLoad);
+            let loadPromises = [];
+            let loadedCount = 0;
+            
+            if (channelsToLoad.length < channels.length) {
+                console.warn(`為了記憶體安全，只載入前 ${maxChannelsToLoad} 個頻道，共 ${channels.length} 個頻道`);
+            }
+            
+            channelsToLoad.forEach(function(channel, index) {
+                const channelKey = `${selectedDate}_${channel.name}`;
+                
+                // 如果已經載入過，跳過
+                if (allChannelsData[channelKey]) {
+                    return;
+                }
+                
+                // 添加延遲載入，避免同時發送太多請求
+                setTimeout(() => {
+                    const promise = $.get(`/api/channel/${selectedDate}/${encodeURIComponent(channel.name)}/${encodeURIComponent(channel.json_file)}`)
+                        .done(function(data) {
+                            // 限制每個頻道的訊息數量
+                            if (data.posts && data.posts.length > maxMessagesPerChannel) {
+                                console.warn(`頻道 ${channel.name} 訊息過多 (${data.posts.length})，只保留最新 ${maxMessagesPerChannel} 條`);
+                                data.posts = data.posts.slice(-maxMessagesPerChannel);
+                                data.total_posts = data.posts.length;
+                            }
+                            
+                            allChannelsData[channelKey] = data;
+                            loadedCount++;
+                            
+                            // 檢查記憶體使用情況
+                            if (loadedCount % 5 === 0) {
+                                const memoryInfo = getMemoryUsageEstimate();
+                                console.log(`已載入 ${loadedCount}/${channelsToLoad.length} 個頻道，估計記憶體使用: ${memoryInfo}`);
+                                
+                                // 如果記憶體使用過高，停止載入
+                                if (memoryInfo > 100) { // 100MB 限制
+                                    console.warn('記憶體使用過高，停止載入更多頻道');
+                                    buildGlobalSearchIndexSafely();
+                                    return;
+                                }
+                            }
+                            
+                            // 所有頻道載入完成
+                            if (loadedCount === channelsToLoad.length) {
+                                buildGlobalSearchIndexSafely();
+                            }
+                        })
+                        .fail(function() {
+                            console.warn(`無法載入頻道 ${channel.name} 的資料`);
+                            loadedCount++;
+                            if (loadedCount === channelsToLoad.length) {
+                                buildGlobalSearchIndexSafely();
+                            }
+                        });
+                    
+                    loadPromises.push(promise);
+                }, index * 200); // 每個請求間隔 200ms
+            });
+            
+            // 如果沒有新頻道需要載入
+            if (loadPromises.length === 0) {
+                buildGlobalSearchIndexSafely();
+            }
+        })
+        .fail(function() {
+            console.error('載入頻道列表失敗');
+            isLoadingGlobalData = false;
+        });
+}
+
+// 安全建立全域搜尋索引
+function buildGlobalSearchIndexSafely() {
+    try {
+        globalSearchIndex = buildGlobalSearchIndex();
+        const memoryInfo = getMemoryUsageEstimate();
+        console.log(`全域搜尋索引建立完成，共 ${globalSearchIndex.length} 條訊息，估計記憶體使用: ${memoryInfo}`);
+        
+        // 如果索引過大，進行優化
+        if (globalSearchIndex.length > 10000) {
+            console.warn('搜尋索引過大，建議使用更精確的搜尋關鍵字');
+        }
+    } catch (error) {
+        console.error('建立全域搜尋索引時發生錯誤:', error);
+        globalSearchIndex = null;
+    } finally {
+        isLoadingGlobalData = false;
+    }
+}
+
+// 估算記憶體使用情況（簡化版本）
+function getMemoryUsageEstimate() {
+    let totalSize = 0;
+    
+    Object.keys(allChannelsData).forEach(key => {
+        const data = allChannelsData[key];
+        if (data && data.posts) {
+            // 粗略估算每條訊息的記憶體使用
+            totalSize += data.posts.length * 2; // 假設每條訊息約 2KB
+        }
+    });
+    
+    return Math.round(totalSize / 1024); // 返回 MB
+}
+
+// 精確搜尋函數
+function preciseSearch(searchTerm, text) {
     if (!searchTerm) return true;
     
-    // 直接包含搜尋
-    if (text.includes(searchTerm)) return true;
+    // 分割搜尋詞（支援多個關鍵字）
+    const keywords = searchTerm.trim().split(/\s+/);
     
-    // 模糊搜尋 - 檢查字符順序
-    let searchIndex = 0;
-    for (let i = 0; i < text.length && searchIndex < searchTerm.length; i++) {
-        if (text[i] === searchTerm[searchIndex]) {
-            searchIndex++;
-        }
-    }
-    return searchIndex === searchTerm.length;
+    // 所有關鍵字都必須存在
+    return keywords.every(keyword => {
+        // 精確匹配（包含完整詞語）
+        if (text.includes(keyword)) return true;
+        
+        // 詞語邊界匹配（避免部分匹配造成的誤判）
+        const wordBoundaryRegex = new RegExp(`\\b${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
+        return wordBoundaryRegex.test(text);
+    });
 }
 
 // 執行搜尋
 function performSearch(searchTerm) {
-    if (!currentChannelData || !searchIndex) {
+    const searchScope = $('#searchScope').val();
+    
+    if (searchTerm === '') {
+        if (currentChannelData) {
+            filteredPosts = currentChannelData.posts;
+            displayMessages(filteredPosts);
+        }
+        $('#clearSearch').hide();
+        $('#searchStatus').show().text('輸入關鍵字開始搜尋');
+        $('#searchResultsInfo').hide();
         return;
     }
     
-    if (searchTerm === '') {
-        filteredPosts = currentChannelData.posts;
-        $('#clearSearch').hide();
+    const lowerSearchTerm = searchTerm.toLowerCase();
+    
+    if (searchScope === 'all') {
+        // 全域搜尋
+        if (!globalSearchIndex) {
+            if (isLoadingGlobalData) {
+                $('#searchStatus').show().html('<i class="fas fa-spinner fa-spin me-1"></i>正在載入全域搜尋資料，請稍候...');
+            } else {
+                $('#searchStatus').show().html('<i class="fas fa-download me-1"></i>正在準備全域搜尋資料...');
+                loadAllChannelsForSearch();
+            }
+            $('#searchResultsInfo').hide();
+            return;
+        }
+        
+        // 檢查搜尋關鍵字長度（避免過於寬泛的搜尋）
+        if (lowerSearchTerm.length < 2) {
+            $('#searchStatus').show().text('全域搜尋請輸入至少 2 個字符');
+            $('#searchResultsInfo').hide();
+            return;
+        }
+        
+        const globalResults = globalSearchIndex
+            .filter(item => preciseSearch(lowerSearchTerm, item.searchText));
+        
+        displayGlobalSearchResults(globalResults, lowerSearchTerm);
+        
+        // 更新搜尋結果統計
+        const resultCount = globalResults.length;
+        const totalCount = globalSearchIndex.length;
+        const loadedChannels = Object.keys(allChannelsData).length;
+        $('#searchResults').text(resultCount);
+        
+        if (resultCount === 0) {
+            $('#searchResultsInfo').html(`<i class="fas fa-exclamation-triangle text-warning me-1"></i>未找到匹配結果`);
+        } else {
+            $('#searchResultsInfo').html(`<i class="fas fa-check-circle text-success me-1"></i>找到 <span class="fw-bold">${resultCount}</span> / ${totalCount} 條結果 (${loadedChannels} 個頻道)`);
+        }
+        
     } else {
-        const lowerSearchTerm = searchTerm.toLowerCase();
+        // 當前頻道搜尋
+        if (!currentChannelData || !searchIndex) {
+            $('#searchStatus').show().text('請先選擇頻道');
+            $('#searchResultsInfo').hide();
+            return;
+        }
+        
         filteredPosts = searchIndex
-            .filter(item => fuzzySearch(lowerSearchTerm, item.searchText))
+            .filter(item => preciseSearch(lowerSearchTerm, item.searchText))
             .map(item => item.post);
-        $('#clearSearch').show();
+        
+        displayMessages(filteredPosts);
+        
+        // 更新搜尋結果統計
+        const resultCount = filteredPosts.length;
+        const totalCount = currentChannelData.posts.length;
+        $('#searchResults').text(resultCount);
+        
+        if (resultCount === 0) {
+            $('#searchResultsInfo').html(`<i class="fas fa-exclamation-triangle text-warning me-1"></i>未找到匹配結果`);
+        } else {
+            $('#searchResultsInfo').html(`<i class="fas fa-check-circle text-success me-1"></i>找到 <span class="fw-bold">${resultCount}</span> / ${totalCount} 條結果`);
+        }
+        
+        // 如果有搜尋結果，滾動到第一個結果
+        if (filteredPosts.length > 0) {
+            setTimeout(() => {
+                const firstMessage = $('#chatContainer .message').first();
+                if (firstMessage.length) {
+                    firstMessage[0].scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }, 100);
+        }
     }
     
-    $('#searchResults').text(filteredPosts.length);
-    displayMessages(filteredPosts);
+    $('#clearSearch').show();
+    $('#searchStatus').hide();
+    $('#searchResultsInfo').show();
 }
 
 // 搜尋輸入事件（防抖動）
@@ -379,6 +712,14 @@ $('#searchInput').on('input', function() {
     searchTimeout = setTimeout(() => {
         performSearch(searchTerm);
     }, 300);
+});
+
+// 搜尋範圍變更事件
+$('#searchScope').change(function() {
+    const searchTerm = $('#searchInput').val();
+    if (searchTerm) {
+        performSearch(searchTerm);
+    }
 });
 
 // 清除搜尋
@@ -400,6 +741,21 @@ function hideLoading() {
     $('#loading').hide();
 }
 
+// 清理記憶體
+function clearMemory() {
+    // 清理全域搜尋資料
+    allChannelsData = {};
+    globalSearchIndex = null;
+    isLoadingGlobalData = false;
+    
+    // 強制垃圾回收（如果瀏覽器支援）
+    if (window.gc) {
+        window.gc();
+    }
+    
+    console.log('記憶體已清理');
+}
+
 // 隱藏聊天
 function hideChat() {
     $('#chatContainer').hide();
@@ -411,6 +767,7 @@ function hideChat() {
     $('#searchInput').val('');
     $('#searchResults').text('0');
     $('#clearSearch').hide();
+    $('#searchScope').val('channel'); // 重置為頻道搜尋
     clearTimeout(searchTimeout);
 }
 </script>
